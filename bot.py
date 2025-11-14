@@ -8584,15 +8584,27 @@ async def _process_imap_results_global():
             if not user_id or not acc_id or not chat_id:
                 return
             
+            # Get account object
+            accounts = await list_accounts_async(user_id)
+            acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+            
+            if not acc:
+                log_send_event(f"IMAP: Account not found for result uid={user_id} acc_id={acc_id}")
+                return
+            
+            # Build message data dict matching expected format
+            mdat = {
+                "from": result.get("from", ""),
+                "subject": result.get("subject", ""),
+                "body": result.get("body", ""),
+            }
+            
             # Publish to Telegram chat using existing function
             await publish_incoming_to_chat_async(
                 user_id=user_id,
+                acc=acc,
                 chat_id=chat_id,
-                from_email=result.get("from", ""),
-                subject=result.get("subject", ""),
-                body=result.get("body", ""),
-                email_account=email,
-                display_name=result.get("display_name", "")
+                mdat=mdat
             )
             
         except Exception as e:
