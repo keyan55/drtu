@@ -674,6 +674,7 @@ from smtp25 import STOPWORDS  # глобальные стоп-слова
 from smtp25 import set_sticky_proxy_for_account
 from tg_internal_cache import internal_id_from_tg
 import imap_runtime  # New IMAP runtime module
+from imap_runtime import ImapAccountConfig  # Import account config from runtime
 
 async def U(msg_or_call):
 
@@ -1152,43 +1153,8 @@ class OutboxJob:
     src_tg_mid: int | None = None  # исходное сообщение (для reply‑треда)
     
 @dataclass
-class ImapAccountConfig:
-    """Конфигурация аккаунта для процесса IMAP"""
-    user_id: int
-    acc_id: int
-    email: str
-    password: str
-    display_name: str
-    chat_id: int
-    host: str
-    proxy: Optional[Dict[str, Any]] = None
-    
-    def to_dict(self) -> dict:
-        """Сериализация для передачи через Queue"""
-        return {
-            "user_id": self.user_id,
-            "acc_id": self.acc_id,
-            "email": self.email,
-            "password": self.password,
-            "display_name": self.display_name,
-            "chat_id": self.chat_id,
-            "host": self.host,
-            "proxy": self.proxy
-        }
-    
-    @classmethod
-    def from_dict(cls, d: dict) -> "ImapAccountConfig":
-        """Десериализация из Queue"""
-        return cls(
-            user_id=d["user_id"],
-            acc_id=d["acc_id"],
-            email=d["email"],
-            password=d["password"],
-            display_name=d["display_name"],
-            chat_id=d["chat_id"],
-            host=d["host"],
-            proxy=d.get("proxy")
-        )
+
+# ===== REMOVED: ImapAccountConfig now imported from imap_runtime =====
 
 
 class UserImapStatus:
