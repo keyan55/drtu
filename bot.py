@@ -417,67 +417,13 @@ SHARED_EXECUTOR = ThreadPoolExecutor(max_workers=60)  # Оптимизирова
 # Расчет: 13 пользователей × ~5 параллельных HTTP запросов на пользователя = 65 воркеров
 # Используем 60 воркеров с небольшим запасом для обработки пиковых нагрузок
 
-# ===== IMAP constants (REPLACE THIS WHOLE BLOCK) =====
-IMAP_EXECUTOR = ThreadPoolExecutor(max_workers=10)  # Заглушка для совместимости с rotation_run
-
-# Размер пула процессов под ваш сервер (8 CPU, 16 GB RAM):
-# ВАЖНО: Каждый процесс multiprocessing.spawn потребляет ~180 MB RAM (базовая память Python интерпретатора)
-# Это базовая стоимость процесса и ее нельзя уменьшить без изменения архитектуры.
-# 
-# РЕАЛЬНОЕ ИСПОЛЬЗОВАНИЕ ПАМЯТИ (по данным top):
-# - Каждый процесс: ~140-220 MB (в среднем ~180 MB)
-# - При 32 процессах: 32 × 180 MB = ~5.7 GB (только воркеры)
-# - Основной процесс бота: ~1.2 GB
-# - ИТОГО: ~7 GB (но реально используется 10.8 GB + 1.4 GB swap)
-#
-# ПРОБЛЕМА: Использование памяти выше ожидаемого
-# РЕШЕНИЕ: Уменьшаем количество процессов и увеличиваем аккаунтов на процесс
-#
-# Оптимизированная конфигурация для полной нагрузки (13 пользователей, 1,261 аккаунт):
-# ПРОБЛЕМА: При полной нагрузке нужно обработать 1,261 аккаунт
-# - 20 процессов × 180 MB = ~3.6 GB (воркеры)
-# - 20 процессов × 65 аккаунтов = 1,300 аккаунтов (достаточно для 1,261)
-# - Основной процесс: ~1.2 GB
-# - ИТОГО: ~4.8-5.5 GB (приемлемо для 16 GB сервера)
-# 
-# ВАЖНО: При добавлении аккаунтов память процесса может расти до ~200-250 MB
-# Реальное использование: 20 процессов × 220 MB = ~4.4 GB (с запасом)
-IMAP_PROCESS_POOL_SIZE = 34  # Чуть увеличено для более стабильного чтения (1,261 аккаунта / 13 пользователей)
-
-# Целевой интервал опроса каждого ящика:
-IMAP_POLL_INTERVAL_MIN = 5.0
-IMAP_POLL_INTERVAL_MAX = 6.0
-
-# Таймауты (с учетом SOCKS/SSL):
-IMAP_TIMEOUT = 12
-IMAP_CONNECTION_TIMEOUT = 10
-IMAP_SOCKET_TIMEOUT = 10
-IMAP_READ_TIMEOUT = 8
-IMAP_WRITE_TIMEOUT = 6
-IMAP_NOOP_TIMEOUT = 3
-
-# Переподключения / бэкофф:
-IMAP_RECONNECT_DELAY = 2.0
-IMAP_MAX_RECONNECT_ATTEMPTS = 3
-IMAP_BACKOFF_MAX = 600.0  # до 10 минут
-
-# Ограничения очередей:
-IMAP_ACCOUNT_QUEUE_MAXSIZE = 512    # Очередь задач аккаунтов
-IMAP_RESULT_QUEUE_MAXSIZE = 2048    # Очередь результатов
-
-# Инициализируются при старте:
-IMAP_ACCOUNT_QUEUE: Queue = None
-IMAP_RESULT_QUEUE: Queue = None
-IMAP_WORKER_PROCESSES: list[Process] = []
-IMAP_WORKER_STOP_EVENT: Event = None
-IMAP_MP_CONTEXT = None  # Контекст multiprocessing для создания процессов
-
-# Статус аккаунтов:
-IMAP_ACCOUNT_STATUS: dict[tuple[int, int], dict] = {}
-
-# Статус пользователей IMAP (для совместимости с кодом, использующим ensure_user_imap_status)
-IMAP_STATUS: dict[int, "UserImapStatus"] = {}
-# ===== END IMAP constants BLOCK =====
+# ===== OLD IMAP CONSTANTS REMOVED - NOW USING imap_runtime MODULE =====
+# All IMAP-related constants moved to imap_runtime.py
+# Legacy compatibility stubs for code that may still reference these
+IMAP_EXECUTOR = ThreadPoolExecutor(max_workers=10)  # Stub for compatibility with rotation_run
+IMAP_ACCOUNT_STATUS: dict[tuple[int, int], dict] = {}  # Compatibility stub
+IMAP_STATUS: dict[int, "UserImapStatus"] = {}  # Compatibility stub
+# ===== END OLD IMAP CONSTANTS =====
 
 CLEANUP_PERIOD = 48 * 3600  # 48 часов между одноразовыми запусками
 LAST_CLEANUP_MARKER = Path(__file__).resolve().parent / ".last_cleanup_ts"
@@ -727,6 +673,7 @@ import smtp25
 from smtp25 import STOPWORDS  # глобальные стоп-слова
 from smtp25 import set_sticky_proxy_for_account
 from tg_internal_cache import internal_id_from_tg
+import imap_runtime  # New IMAP runtime module
 
 async def U(msg_or_call):
 
@@ -8495,1756 +8442,221 @@ import pickle
 
 
 
-def _imap_worker_pool_worker(account_queue: Queue, result_queue: Queue, stop_event: Event,
-                             poll_interval_min: float, poll_interval_max: float, 
-                             connection_timeout: float, read_timeout: float, write_timeout: float,
-                             noop_timeout: float, reconnect_delay: float, max_reconnect_attempts: int, port_ssl: int):
-    """
-    Воркер процесс-пула - обрабатывает аккаунты из очереди с открытыми соединениями.
-    ВАЖНО: Все IMAP операции используют таймауты для предотвращения зависаний.
-    Старые соединения правильно закрываются (shutdown + close) для предотвращения залипания сокетов.
-    
-    АРХИТЕКТУРА:
-    - Воркер берет аккаунты из очереди и добавляет в свой account_states
-    - Соединения остаются открытыми между опросами (state["imap"])
-    - Каждый аккаунт опрашивается с интервалом 5 секунд (next_poll_time)
-    - Аккаунты обрабатываются по очереди - воркер проходит по account_states и опрашивает готовые
-    - После опроса аккаунт остается в account_states с обновленным next_poll_time
-    
-    ПРОИЗВОДИТЕЛЬНОСТЬ (оптимизировано для 30 процессов при полной нагрузке 1,261 аккаунт):
-    - С открытым соединением один опрос: ~0.3-0.8 секунды (UNSEEN + fetch)
-    - Среднее время на аккаунт: ~0.5 секунды
-    - За 5 секунд один процесс может опросить: 5 / 0.5 = 10 аккаунтов
-    - При 30 процессах: 30 * 10 = 300 аккаунтов за 5 секунд
-    - Скорость опроса: 300 / 5 = 60 аккаунтов/секунду
-    - Для 1,261 аккаунта: 1,261 / 60 = ~21 секунда на полный цикл (приемлемо при интервале опроса 5-6 секунд)
-    - Каждый процесс обрабатывает ~42 аккаунта (1,261 / 30), что соответствует интервалу опроса 5-6 секунд
-    
-    ВАЖНО: Автоматическое переподключение при разрыве соединения
-    - При разрыве соединения (проверка через NOOP) происходит автоматическое переподключение
-    - При временных ошибках - повторная попытка с задержкой
-    - При постоянных ошибках авторизации - аккаунт удаляется из обработки
-    """
-    import imaplib
-    import ssl
-    import socket
-    import socks
-    import time as _time
-    import random as _random
-    import re
-    import html as html_module
-    from html.parser import HTMLParser
-    from html import unescape as html_unescape
-    
-    # Функция извлечения текста из HTML (копия из основного модуля)
-    def _extract_text_from_html(html_text: str) -> str:
-        """Извлекает чистый текст из HTML, обрабатывает HTML entities и удаляет подписи."""
-        class TextExtractor(HTMLParser):
-            def __init__(self):
-                super().__init__()
-                self.text_parts = []
-                self.in_script = False
-                self.in_style = False
-                
-            def handle_starttag(self, tag, attrs):
-                tag_lower = tag.lower()
-                if tag_lower in ('script', 'style'):
-                    if tag_lower == 'script':
-                        self.in_script = True
-                    else:
-                        self.in_style = True
-                elif tag_lower == 'br':
-                    self.text_parts.append('\n')
-                    
-            def handle_endtag(self, tag):
-                tag_lower = tag.lower()
-                if tag_lower in ('script', 'style'):
-                    if tag_lower == 'script':
-                        self.in_script = False
-                    else:
-                        self.in_style = False
-                elif tag_lower in ('div', 'p', 'li', 'ul', 'ol', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'tr', 'blockquote', 'pre'):
-                    self.text_parts.append('\n')
-                elif tag_lower in ('td', 'th'):
-                    self.text_parts.append('\t')
-                elif tag_lower == 'br':
-                    self.text_parts.append('\n')
-                    
-            def handle_data(self, data):
-                if not self.in_script and not self.in_style:
-                    self.text_parts.append(data)
-        
-        try:
-            html_text = html_module.unescape(html_text)
-            parser = TextExtractor()
-            parser.feed(html_text)
-            text = ''.join(parser.text_parts)
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'&nbsp;', ' ', text)
-            text = re.sub(r'&amp;', '&', text)
-            text = re.sub(r'&lt;', '<', text)
-            text = re.sub(r'&gt;', '>', text)
-            text = re.sub(r'[ \t]+', ' ', text)
-            text = re.sub(r'[ \t]*\n[ \t]*', '\n', text)
-            text = re.sub(r'\n{3,}', '\n\n', text)
-            lines = text.split('\n')
-            text = '\n'.join(line.rstrip() for line in lines)
-            
-            # Удаляем подписи GMX
-            lines = text.split('\n')
-            if len(lines) > 5:
-                main_lines = lines[:-5]
-                signature_candidate = lines[-5:]
-                signature_text = '\n'.join(signature_candidate).lower()
-                has_signature = any(marker in signature_text for marker in [
-                    'gesendet mit der gmx', 'sent with gmx', 'gmx mail app',
-                ])
-                if has_signature:
-                    sig_start = len(main_lines)
-                    for i in range(len(signature_candidate) - 1, -1, -1):
-                        line_lower = signature_candidate[i].lower().strip()
-                        if any(marker in line_lower for marker in [
-                            'gesendet mit der gmx', 'sent with gmx', 'gmx mail app',
-                        ]):
-                            for j in range(i - 1, -1, -1):
-                                if signature_candidate[j].strip() == '--':
-                                    sig_start = len(main_lines) + j
-                                    break
-                            break
-                    filtered_lines = lines[:sig_start] if sig_start < len(lines) else main_lines
-                else:
-                    filtered_lines = lines
-            else:
-                filtered_lines = lines
-            
-            return '\n'.join(filtered_lines).strip()
-        except Exception:
-            # Fallback: простое удаление тегов
-            text = html_unescape(html_text)
-            text = re.sub(r'<[^>]+>', ' ', text)
-            text = re.sub(r'&nbsp;', ' ', text)
-            return text.strip()
-    
-    # Словарь для хранения состояния каждого аккаунта (email -> state)
-    # state = {"config": ImapAccountConfig, "imap": imaplib.IMAP4, "next_poll_time": float, "last_poll_time": float, "reconnect_attempts": int}
-    account_states: dict[str, dict] = {}
-    
-    # ВАЖНО: Периодическая очистка памяти (gc.collect) для освобождения памяти от закрытых соединений
-    # НЕ удаляем аккаунты вообще - только помечаем как неактивные при ошибках авторизации
-    # Аккаунты с ошибками авторизации помечаются как disabled=True и пропускаются при обработке
-    last_cleanup_time = _time.time()
-    CLEANUP_INTERVAL = 60.0  # Периодическая сборка мусора каждые 60 секунд для освобождения памяти
-    # ВАЖНО: При уменьшении количества процессов нужно увеличить аккаунтов на процесс
-    # 20 процессов × 65 аккаунтов = 1,300 аккаунтов (достаточно для 1,261 аккаунта при полной нагрузке)
-    # Каждый процесс обрабатывает ~65 аккаунтов, что дает интервал опроса ~5-6 секунд
-    # При 20 процессах: 20 × 10 аккаунтов/5сек = 40 аккаунтов/сек
-    # Для 1,261 аккаунта: 1,261 / 40 = ~32 секунды на полный цикл (приемлемо при интервале 5-6 секунд)
-    MAX_ACCOUNTS_PER_WORKER = 40  # Оптимизировано: 30 процессов × 40 аккаунтов = 1,200 максимум (для равномерного распределения)
-    
-    def with_timeout(imap_obj, timeout_val, fn, *args, **kwargs):
-        """
-        Helper для выполнения IMAP операций с socket-level таймаутом.
-        ВАЖНО: устанавливает таймаут на уровне сокета, чтобы предотвратить "залипшие" соединения.
-        Все IMAP операции (login, select, search, fetch, store, noop) ДОЛЖНЫ использовать этот helper.
-        Без таймаутов операции могут зависнуть навсегда, что приведет к утечке памяти и зависанию процесса.
-        """
-        if not imap_obj:
-            raise ValueError("imap_obj is None")
-        
-        # ВАЖНО: Устанавливаем таймаут на сокете ПЕРЕД выполнением операции
-        if hasattr(imap_obj, 'sock') and imap_obj.sock:
-            old_timeout = imap_obj.sock.gettimeout()
-            try:
-                # Устанавливаем таймаут на сокете
-                imap_obj.sock.settimeout(timeout_val)
-                # Выполняем операцию с таймаутом
-                result = fn(*args, **kwargs)
-                return result
-            finally:
-                # Восстанавливаем старый таймаут
-                try:
-                    if old_timeout is not None:
-                        imap_obj.sock.settimeout(old_timeout)
-                    else:
-                        # Если таймаут не был установлен, устанавливаем дефолтный
-                        imap_obj.sock.settimeout(IMAP_READ_TIMEOUT)
-                except Exception:
-                    pass
-        else:
-            # Если сокета нет, выполняем операцию без таймаута (но это не должно происходить)
-            return fn(*args, **kwargs)
-    
-    def connect_imap_for_account(config: ImapAccountConfig) -> Tuple[bool, Optional[imaplib.IMAP4], Optional[str], str]:
-        """
-        Подключение к IMAP через прокси с таймаутами для аккаунта.
-        Возвращает (success, imap_obj, error_type, error_msg)
-        """
-        imap_obj = None
-        try:
-            host = config.host
-            port = port_ssl
-            
-            # Используем SocksIMAP4SSL для корректного handshake
-            # ВАЖНО: SocksIMAP4SSL.open() устанавливает socket timeout при создании соединения
-            imap_obj = SocksIMAP4SSL(
-                host,
-                port,
-                proxy=config.proxy,
-                timeout=connection_timeout
-            )
-            
-            # Логин с таймаутом и проверкой кода ответа
-            try:
-                typ, data = with_timeout(imap_obj, connection_timeout, imap_obj.login, config.email, config.password)
-                login_typ = str(typ).upper()
-                
-                if login_typ != "OK":
-                    error_msg = (data[0] if data and len(data) > 0 else b"").decode("utf-8", errors="ignore")
-                    error_lower = error_msg.lower()
-                    
-                    if any(keyword in error_lower for keyword in ["auth", "invalid", "login", "password", "credentials", "authentication failed"]):
-                        try:
-                            imap_obj.logout()
-                        except:
-                            pass
-                        return False, None, "auth_error", f"LOGIN failed: {error_msg}"
-                    else:
-                        try:
-                            imap_obj.logout()
-                        except:
-                            pass
-                        return False, None, "temp_error", f"LOGIN failed: {error_msg}"
-            except imaplib.IMAP4.error as e:
-                error_str = str(e).lower()
-                try:
-                    if imap_obj:
-                        imap_obj.logout()
-                except:
-                    pass
-                if any(keyword in error_str for keyword in ["auth", "invalid", "login", "password", "credentials"]):
-                    return False, None, "auth_error", f"LOGIN error: {str(e)}"
-                else:
-                    return False, None, "temp_error", f"LOGIN error: {str(e)}"
-            except Exception as e:
-                try:
-                    if imap_obj:
-                        imap_obj.logout()
-                except:
-                    pass
-                error_str = str(e).lower()
-                if any(keyword in error_str for keyword in ["auth", "invalid", "login", "password", "credentials"]):
-                    return False, None, "auth_error", f"LOGIN exception: {str(e)}"
-                else:
-                    return False, None, "temp_error", f"LOGIN exception: {str(e)}"
-            
-            # Выбор INBOX с таймаутом
-            try:
-                typ, data = with_timeout(imap_obj, connection_timeout, imap_obj.select, "INBOX")
-                select_typ = str(typ).upper()
-                
-                if select_typ != "OK":
-                    error_msg = (data[0] if data and len(data) > 0 else b"").decode("utf-8", errors="ignore")
-                    error_lower = error_msg.lower()
-                    
-                    if any(keyword in error_lower for keyword in ["auth", "invalid", "login", "not authenticated"]):
-                        try:
-                            imap_obj.logout()
-                        except:
-                            pass
-                        return False, None, "auth_error", f"SELECT INBOX auth error: {error_msg}"
-                    else:
-                        try:
-                            imap_obj.logout()
-                        except:
-                            pass
-                        return False, None, "temp_error", f"SELECT INBOX failed: {error_msg}"
-            except imaplib.IMAP4.error as e:
-                error_str = str(e).lower()
-                try:
-                    if imap_obj:
-                        imap_obj.logout()
-                except:
-                    pass
-                if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
-                    return False, None, "auth_error", f"SELECT INBOX error: {str(e)}"
-                else:
-                    return False, None, "temp_error", f"SELECT INBOX error: {str(e)}"
-            except Exception as e:
-                try:
-                    if imap_obj:
-                        imap_obj.logout()
-                except:
-                    pass
-                error_str = str(e).lower()
-                if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
-                    return False, None, "auth_error", f"SELECT INBOX exception: {str(e)}"
-                else:
-                    return False, None, "temp_error", f"SELECT INBOX exception: {str(e)}"
-            
-            return True, imap_obj, None, "connected"
-            
-        except Exception as e:
-            try:
-                if imap_obj:
-                    imap_obj.logout()
-            except:
-                pass
-            error_str = str(e).lower()
-            if any(keyword in error_str for keyword in ["auth", "invalid", "login", "password", "credentials"]):
-                return False, None, "auth_error", f"{type(e).__name__}: {str(e)}"
-            else:
-                return False, None, "temp_error", f"{type(e).__name__}: {str(e)}"
-    
-    def check_connection(imap_obj) -> bool:
-        """Проверка живости соединения через NOOP"""
-        if not imap_obj:
-            return False
-        try:
-            typ, _ = with_timeout(imap_obj, noop_timeout, imap_obj.noop)
-            return str(typ).upper() == "OK"
-        except:
-            return False
-    
-    def fetch_new_messages(imap_obj, config: ImapAccountConfig) -> Tuple[int, list, Optional[str]]:
-        """
-        Получение новых сообщений для аккаунта.
-        Возвращает (count, messages, error_type)
-        """
-        if not imap_obj:
-            return -1, [], "auth_error"
-        
-        try:
-            # Проверка соединения
-            if not check_connection(imap_obj):
-                return -2, [], "temp_error"
-            
-            # Поиск непрочитанных
-            try:
-                typ, data = with_timeout(imap_obj, read_timeout, imap_obj.uid, "search", None, "UNSEEN")
-                search_typ = str(typ).upper()
-                
-                if search_typ != "OK":
-                    error_msg = (data[0] if data and len(data) > 0 else b"").decode("utf-8", errors="ignore")
-                    error_lower = error_msg.lower()
-                    
-                    if any(keyword in error_lower for keyword in ["auth", "invalid", "login", "not authenticated", "not logged in"]):
-                        return -1, [], "auth_error"
-                    else:
-                        return -2, [], "temp_error"
-            except imaplib.IMAP4.error as e:
-                error_str = str(e).lower()
-                if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
-                    return -1, [], "auth_error"
-                else:
-                    return -2, [], "temp_error"
-            except Exception as e:
-                error_str = str(e).lower()
-                if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
-                    return -1, [], "auth_error"
-                else:
-                    return -2, [], "temp_error"
-            
-            uid_bytes = (data[0] or b"")
-            unseen_uids = [u for u in uid_bytes.split() if u]
-            
-            if not unseen_uids:
-                return 0, [], None
-            
-            # Получение сообщений
-            messages = []
-            for uid in unseen_uids:
-                try:
-                    typ, msg_data = with_timeout(imap_obj, read_timeout, imap_obj.uid, "fetch", uid, "(RFC822)")
-                    if str(typ).upper() != "OK" or not msg_data:
-                        continue
-
-                    # Парсинг сообщения
-                    part = next((x for x in msg_data if isinstance(x, tuple) and x and isinstance(x[1], (bytes, bytearray))), None)
-                    if not part:
-                        continue
-                    
-                    import email as _email
-                    from email.header import decode_header
-                    
-                    msg = _email.message_from_bytes(part[1])
-                    
-                    # Извлечение данных
-                    from_email = msg.get("From", "")
-                    from_name = ""
-                    subject = ""
-                    body = ""
-                    
-                    # Декодирование заголовков
-                    def decode_mime_header(s):
-                        if not s:
-                            return ""
-                        decoded_parts = decode_header(s)
-                        decoded_str = ""
-                        for part, encoding in decoded_parts:
-                            if isinstance(part, bytes):
-                                try:
-                                    decoded_str += part.decode(encoding or "utf-8", errors="ignore")
-                                except:
-                                    decoded_str += part.decode("utf-8", errors="ignore")
-                            else:
-                                decoded_str += str(part)
-                        return decoded_str
-                    
-                    from_email = decode_mime_header(from_email)
-                    subject = decode_mime_header(msg.get("Subject", ""))
-                    
-                    # Извлечение тела с обработкой HTML
-                    text_parts = []
-                    html_parts = []
-                    html_raw_parts = []  # Для fallback, если парсер вернет пустую строку
-                    
-                    if msg.is_multipart():
-                        for part in msg.walk():
-                            content_type = part.get_content_type()
-                            disp = str(part.get("Content-Disposition") or "")
-                            if "attachment" in disp.lower():
-                                continue
-                            try:
-                                payload = part.get_payload(decode=True)
-                                if not payload:
-                                    continue
-                                # Пробуем декодировать с различными кодировками
-                                charset = part.get_content_charset() or "utf-8"
-                                try:
-                                    text = payload.decode(charset, errors="replace")
-                                except (UnicodeDecodeError, LookupError):
-                                    # Fallback на utf-8, затем latin-1
-                                    try:
-                                        text = payload.decode("utf-8", errors="replace")
-                                    except Exception:
-                                        text = payload.decode("latin-1", errors="replace")
-                            except Exception:
-                                continue
-                            
-                            if not text or not text.strip():
-                                continue
-                            
-                            # Обрабатываем разные типы контента
-                            if content_type == "text/plain":
-                                text_parts.append(text)
-                            elif content_type == "text/html":
-                                # Сохраняем сырой HTML для fallback
-                                html_raw_parts.append(text)
-                                # Извлекаем текст из HTML
-                                html_text = _extract_text_from_html(text)
-                                if html_text and html_text.strip():
-                                    html_parts.append(html_text)
-                            elif content_type.startswith("text/"):
-                                # Для других текстовых типов (text/rtf, text/enriched и т.д.) пробуем как plain text
-                                text_parts.append(text)
-                    else:
-                        try:
-                            payload = msg.get_payload(decode=True)
-                            if payload:
-                                charset = msg.get_content_charset() or "utf-8"
-                                try:
-                                    text = payload.decode(charset, errors="replace")
-                                except (UnicodeDecodeError, LookupError):
-                                    try:
-                                        text = payload.decode("utf-8", errors="replace")
-                                    except Exception:
-                                        text = payload.decode("latin-1", errors="replace")
-                                
-                                content_type = msg.get_content_type()
-                                if content_type == "text/plain":
-                                    if text and text.strip():
-                                        text_parts.append(text)
-                                elif content_type == "text/html":
-                                    if text and text.strip():
-                                        html_raw_parts.append(text)
-                                        html_text = _extract_text_from_html(text)
-                                        if html_text and html_text.strip():
-                                            html_parts.append(html_text)
-                                else:
-                                    # Если неизвестный тип, пробуем как текст
-                                    if text and text.strip():
-                                        text_parts.append(text)
-                        except Exception:
-                            pass
-                    
-                    # Используем plain text если есть, иначе HTML
-                    if text_parts:
-                        body = "\n".join(text_parts)
-                    elif html_parts:
-                        body = "\n".join(html_parts)
-                    elif html_raw_parts:
-                        # Fallback: если парсер HTML вернул пустую строку, используем простую обработку
-                        # html_unescape уже импортирован в начале функции
-                        fallback_texts = []
-                        for raw_html in html_raw_parts:
-                            try:
-                                # Простое удаление тегов и декодирование entities (сохраняем структуру)
-                                simple_text = html_unescape(raw_html)
-                                # Заменяем блочные элементы на переносы строк перед удалением тегов
-                                simple_text = re.sub(r'</?(?:div|p|br|li|tr|td|th)[^>]*>', '\n', simple_text, flags=re.IGNORECASE)
-                                simple_text = re.sub(r'<[^>]+>', ' ', simple_text)
-                                # Обрабатываем entities
-                                simple_text = re.sub(r'&nbsp;', ' ', simple_text)
-                                simple_text = re.sub(r'&amp;', '&', simple_text)
-                                simple_text = re.sub(r'&lt;', '<', simple_text)
-                                simple_text = re.sub(r'&gt;', '>', simple_text)
-                                # Нормализуем пробелы, но сохраняем переносы строк
-                                simple_text = re.sub(r'[ \t]+', ' ', simple_text)  # Только пробелы и табы
-                                simple_text = re.sub(r'[ \t]*\n[ \t]*', '\n', simple_text)  # Пробелы вокруг переносов
-                                simple_text = re.sub(r'\n{3,}', '\n\n', simple_text)  # Максимум 2 переноса подряд
-                                # Убираем пробелы в конце строк, но сохраняем структуру
-                                lines = simple_text.split('\n')
-                                simple_text = '\n'.join(line.rstrip() for line in lines)
-                                if simple_text.strip():
-                                    fallback_texts.append(simple_text.strip())
-                            except Exception:
-                                pass
-                        body = "\n\n".join(fallback_texts) if fallback_texts else ""
-                    else:
-                        body = ""
-                    
-                    # Минимальная очистка: удаляем только избыточные пустые строки (сохраняем структуру)
-                    if body:
-                        # Убираем пробелы в конце строк, но сохраняем переносы
-                        lines = body.split('\n')
-                        body = '\n'.join(line.rstrip() for line in lines)
-                        # Удаляем только избыточные пустые строки (более 2 подряд)
-                        body = re.sub(r'\n{3,}', '\n\n', body)
-                        # Убираем пробелы только в начале и конце всего текста
-                        body = body.strip()
-                    
-                    # Логирование для диагностики пустых тел (только если body пустое, но subject есть)
-                    if not body and subject:
-                        import logging
-                        logging.warning(
-                            f"IMAP: пустое тело письма от {from_email}, subject={subject[:50]}, "
-                            f"text_parts={len(text_parts)}, html_parts={len(html_parts)}, "
-                            f"html_raw_parts={len(html_raw_parts)}"
-                        )
-                    
-                    # Парсинг From
-                    try:
-                        from email.utils import parseaddr
-                        from_name, from_email_addr = parseaddr(from_email)
-                        if from_email_addr:
-                            from_email = from_email_addr
-                    except:
-                        pass
-                    
-                    # ВАЖНО: Проверка автоматических отправителей (no-reply@accounts.google.com, noreply@google.com)
-                    # Письма от этих отправителей помечаются как прочитанные, но не публикуются
-                    from_email_lower = from_email.lower().strip() if from_email else ""
-                    automated_senders = [
-                        "no-reply@accounts.google.com",
-                        "noreply@google.com",
-                        "noreply@accounts.google.com",
-                        "no-reply@google.com",
-                    ]
-                    is_automated = from_email_lower in automated_senders
-                    
-                    # Помечаем как прочитанное (всегда, даже для автоматических отправителей)
-                    try:
-                        with_timeout(imap_obj, write_timeout, imap_obj.uid, "store", uid, "+FLAGS", r"(\Seen)")
-                    except:
-                        pass
-                    
-                    # Если это автоматический отправитель, не добавляем в список для публикации
-                    if is_automated:
-                        continue
-                    
-                    # ВАЖНО: Ограничиваем размер body для экономии памяти при полной нагрузке
-                    # Ограничиваем до 5000 символов (достаточно для большинства писем)
-                    MAX_BODY_SIZE = 5000
-                    if body and len(body) > MAX_BODY_SIZE:
-                        body = body[:MAX_BODY_SIZE] + "\n\n[... сообщение обрезано ...]"
-                    
-                    # Ограничиваем размер subject
-                    MAX_SUBJECT_SIZE = 500
-                    if subject and len(subject) > MAX_SUBJECT_SIZE:
-                        subject = subject[:MAX_SUBJECT_SIZE] + "..."
-                    
-                    messages.append({
-                        "uid": uid.decode("utf-8", errors="ignore") if isinstance(uid, bytes) else str(uid),
-                        "from_email": from_email,
-                        "from_name": from_name,
-                        "subject": subject,
-                        "body": body,
-                    })
-                    
-                    # ВАЖНО: Очищаем локальные переменные для экономии памяти
-                    # (переменные будут очищены автоматически после выхода из цикла)
-                        
-                except Exception as e:
-                    continue
-
-            # ВАЖНО: Ограничиваем количество сообщений за один опрос для экономии памяти
-            # Если сообщений слишком много, возвращаем только первые (остальные будут обработаны при следующем опросе)
-            MAX_MESSAGES_PER_POLL = 50
-            if len(messages) > MAX_MESSAGES_PER_POLL:
-                # Логируем, что сообщения обрезаны
-                import sys
-                import os as _os_worker
-                try:
-                    print(f"[WORKER {_os_worker.getpid()}] Too many messages ({len(messages)}), limiting to {MAX_MESSAGES_PER_POLL}", file=sys.stderr, flush=True)
-                except:
-                    pass
-                messages = messages[:MAX_MESSAGES_PER_POLL]
-            
-            return len(messages), messages, None
-            
-        except imaplib.IMAP4.error as e:
-            error_str = str(e).lower()
-            if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
-                return -1, [], "auth_error"
-            else:
-                return -2, [], "temp_error"
-        except Exception as e:
-            error_str = str(e).lower()
-            if any(keyword in error_str for keyword in ["auth", "invalid", "login", "not authenticated"]):
-                return -1, [], "auth_error"
-            else:
-                return -2, [], "temp_error"
-    
-    # Основной цикл воркера
-    while not stop_event.is_set():
-        try:
-            now = _time.time()
-            
-            # ВАЖНО: Периодическая очистка памяти (gc.collect) для освобождения памяти от закрытых соединений
-            # НЕ удаляем аккаунты вообще - только помечаем как неактивные при ошибках авторизации
-            # Аккаунты с ошибками авторизации помечаются как disabled=True и пропускаются при обработке
-            if now - last_cleanup_time >= CLEANUP_INTERVAL:
-                last_cleanup_time = now
-                
-                # ВАЖНО: Принудительная сборка мусора для освобождения памяти
-                # Это освобождает память от закрытых соединений и других объектов
-                import gc
-                gc.collect()
-                
-                # Подсчитываем статистику аккаунтов
-                total_accounts = len(account_states)
-                active_accounts = sum(1 for state in account_states.values() if not state.get("disabled", False) and not state.get("auth_error", False))
-                disabled_accounts = sum(1 for state in account_states.values() if state.get("disabled", False) or state.get("auth_error", False))
-                connected_accounts = sum(1 for state in account_states.values() if state.get("imap") is not None)
-                
-                import sys
-                import os as _os_worker
-                try:
-                    if total_accounts > 0:
-                        print(f"[WORKER {_os_worker.getpid()}] Accounts: total={total_accounts} active={active_accounts} disabled={disabled_accounts} connected={connected_accounts}", file=sys.stderr, flush=True)
-                    # Логируем только если есть аккаунты, чтобы не засорять логи
-                except:
-                    pass
-            
-            # Получаем новые аккаунты из очереди (неблокирующе)
-            # ВАЖНО: используем get_nowait() с обработкой исключений, чтобы не блокироваться
-            # ВАЖНО: Обрабатываем до 50 аккаунтов за итерацию, чтобы не блокировать обработку существующих аккаунтов
-            new_accounts_count = 0
-            max_new_accounts_per_iteration = 50
-            try:
-                while new_accounts_count < max_new_accounts_per_iteration:
-                    try:
-                        config_dict = account_queue.get_nowait()
-                        if config_dict is None:  # Сигнал остановки
-                            break
-                        # Десериализуем конфигурацию
-                        config = ImapAccountConfig.from_dict(config_dict)
-                        email = config.email
-                        if email not in account_states:
-                            account_states[email] = {
-                                "config": config,
-                                "imap": None,
-                                "next_poll_time": now + _random.uniform(poll_interval_min, poll_interval_max),
-                                "last_poll_time": 0.0,
-                                "reconnect_attempts": 0,
-                                "disabled": False,  # Флаг для отключения чтения (при ошибках авторизации)
-                                "auth_error": False  # Флаг ошибки авторизации
-                            }
-                            new_accounts_count += 1
-                        else:
-                            # Если аккаунт уже существует, сбрасываем флаг disabled при добавлении (на случай повторного добавления)
-                            account_states[email]["disabled"] = False
-                            account_states[email]["auth_error"] = False
-                            account_states[email]["config"] = config  # Обновляем конфигурацию
-                            new_accounts_count += 1  # Считаем обновления тоже
-                    except Exception:
-                        # Очередь пуста или ошибка десериализации
-                        break
-            except Exception:
-                pass  # Защита от неожиданных ошибок
-            
-            # Логируем получение новых аккаунтов (только если есть новые)
-            if new_accounts_count > 0:
-                import sys
-                import os as _os_worker
-                try:
-                    print(f"[WORKER {_os_worker.getpid()}] Added {new_accounts_count} new account(s) to processing. Total accounts: {len(account_states)}", file=sys.stderr, flush=True)
-                except:
-                    pass
-            
-            # Обрабатываем каждый аккаунт по очереди
-            # ВАЖНО: НЕ удаляем аккаунты - только помечаем как неактивные при ошибках авторизации
-            for email, state in list(account_states.items()):
-                config = state["config"]
-                imap_obj = state["imap"]
-                
-                # Пропускаем отключенные аккаунты (с ошибками авторизации)
-                if state.get("disabled", False) or state.get("auth_error", False):
-                    continue  # Аккаунт отключен, не обрабатываем
-                
-                # Проверяем, нужно ли обрабатывать этот аккаунт сейчас
-                if now < state["next_poll_time"]:
-                    continue  # Еще не время для опроса
-                
-                # Подключение/переподключение
-                # ВАЖНО: закрываем старое соединение перед переподключением, чтобы не было утечек сокетов
-                if not imap_obj or not check_connection(imap_obj):
-                    if imap_obj:
-                        old_imap = imap_obj
-                        # ВАЖНО: Правильное закрытие старого соединения для предотвращения залипания сокетов
-                        # 1. Сначала разрываем соединение через shutdown (если поддерживается)
-                        try:
-                            if hasattr(old_imap, 'sock') and old_imap.sock:
-                                try:
-                                    old_imap.sock.shutdown(socket.SHUT_RDWR)  # Разрываем соединение
-                                except (OSError, AttributeError):
-                                    pass  # shutdown может не поддерживаться или сокет уже закрыт
-                        except Exception:
-                            pass
-                        # 2. Закрываем сокет
-                        try:
-                            if hasattr(old_imap, 'sock') and old_imap.sock:
-                                old_imap.sock.close()
-                        except Exception:
-                            pass
-                        # 3. Logout (может не сработать, если сокет уже закрыт, но это нормально)
-                        try:
-                            old_imap.logout()
-                        except Exception:
-                            pass
-                        # 4. Дополнительная защита: убеждаемся что сокет закрыт
-                        try:
-                            if hasattr(old_imap, 'sock') and old_imap.sock:
-                                old_imap.sock.close()
-                        except Exception:
-                            pass
-                        imap_obj = None
-                    
-                    success, new_imap, error_type, error_msg = connect_imap_for_account(config)
-                    if success:
-                        imap_obj = new_imap
-                        state["imap"] = imap_obj
-                        state["reconnect_attempts"] = 0
-                        if state["next_poll_time"] == 0.0:
-                            state["next_poll_time"] = now + _random.uniform(poll_interval_min, poll_interval_max)
-                    elif error_type == "auth_error":
-                        # Постоянная ошибка авторизации - отключаем чтение аккаунта (не удаляем)
-                        # Закрываем соединение перед отключением
-                        if imap_obj:
-                            try:
-                                if hasattr(imap_obj, 'sock') and imap_obj.sock:
-                                    try:
-                                        imap_obj.sock.shutdown(socket.SHUT_RDWR)
-                                    except (OSError, AttributeError):
-                                        pass
-                                    imap_obj.sock.close()
-                            except Exception:
-                                pass
-                            try:
-                                imap_obj.logout()
-                            except Exception:
-                                pass
-                        state["imap"] = None
-                        state["disabled"] = True
-                        state["auth_error"] = True
-                        state["reconnect_attempts"] = 0
-                        # Отправляем уведомление об ошибке в основной процесс
-                        try:
-                            result = {
-                                "status": "auth_error",
-                                "error": error_msg or "Permanent auth error",
-                                "user_id": config.user_id,
-                                "acc_id": config.acc_id,
-                                "email": config.email,
-                                "chat_id": config.chat_id,  # ВАЖНО: передаем chat_id для уведомлений
-                                "timestamp": now
-                            }
-                            if not result_queue.full():
-                                result_queue.put_nowait(result)
-                        except Exception:
-                            pass
-                        continue  # Пропускаем дальнейшую обработку этого аккаунта
-                    else:
-                        # Временная ошибка - обновляем время следующего опроса
-                        state["reconnect_attempts"] += 1
-                        state["last_poll_time"] = now  # Обновляем время последней попытки
-                        if state["reconnect_attempts"] < max_reconnect_attempts:
-                            state["next_poll_time"] = now + reconnect_delay * state["reconnect_attempts"]
-                        else:
-                            state["next_poll_time"] = now + reconnect_delay * max_reconnect_attempts
-                        continue  # Пропускаем обработку до следующего опроса
-
-                # ВАЖНО: Проверка зависания - если last_poll_time слишком старое, принудительно переподключаем
-                # Это предотвращает зависание чтения, когда операция зависает на уровне сокета
-                # Проверяем ДО вызова fetch_new_messages, чтобы обнаружить зависание предыдущей операции
-                last_poll = state.get("last_poll_time", 0.0)
-                # Таймаут ожидания завершения fetch: если предыдущий опрос длился слишком долго, переподключаемся.
-                # 45 секунд — компромисс между чувствительностью к зависаниям и избежанием ложных срабатываний
-                max_stall_time = 45.0
-                if last_poll > 0.0 and (now - last_poll) > max_stall_time:
-                    # Аккаунт завис - принудительно переподключаем
-                    import sys
-                    import os as _os_worker
-                    try:
-                        print(f"[WORKER {_os_worker.getpid()}] STALL DETECTED: Account {config.email} stalled for {now - last_poll:.1f}s, forcing reconnect", file=sys.stderr, flush=True)
-                    except:
-                        pass
-                    if imap_obj:
-                        try:
-                            if hasattr(imap_obj, 'sock') and imap_obj.sock:
-                                try:
-                                    imap_obj.sock.shutdown(socket.SHUT_RDWR)
-                                except (OSError, AttributeError):
-                                    pass
-                                imap_obj.sock.close()
-                        except Exception:
-                            pass
-                        try:
-                            imap_obj.logout()
-                        except Exception:
-                            pass
-                    state["imap"] = None
-                    state["reconnect_attempts"] = 0
-                    state["next_poll_time"] = now + reconnect_delay
-                    state["last_poll_time"] = now
-                    continue  # Переподключимся на следующей итерации
-                
-                # ВАЖНО: Обновляем last_poll_time ПЕРЕД вызовом fetch_new_messages для отслеживания зависаний
-                state["last_poll_time"] = now
-                fetch_start_time = now
-                
-                # ВАЖНО: Оборачиваем fetch_new_messages в таймаут на уровне threading, чтобы принудительно прервать зависшие операции
-                # Используем более агрессивный таймаут: 30 секунд (вместо 60)
-                # Потоки создаются как daemon и автоматически завершаются, не создавая утечек памяти
-                fetch_timeout = 25.0  # 25 секунд — даем IMAP чуть больше времени, чтобы догрузить крупные письма
-                count = -2
-                messages = []
-                error_type = "temp_error"
-                
-                import threading
-                fetch_result = {"done": False, "count": -2, "messages": [], "error_type": "temp_error", "exception": None}
-                fetch_lock = threading.Lock()
-                
-                def fetch_worker():
-                    try:
-                        c, m, e = fetch_new_messages(imap_obj, config)
-                        with fetch_lock:
-                            fetch_result["count"] = c
-                            fetch_result["messages"] = m
-                            fetch_result["error_type"] = e
-                            fetch_result["done"] = True
-                    except Exception as exc:
-                        with fetch_lock:
-                            fetch_result["exception"] = exc
-                            fetch_result["done"] = True
-                
-                fetch_thread = threading.Thread(target=fetch_worker, daemon=True)
-                fetch_thread.start()
-                fetch_thread.join(timeout=fetch_timeout)
-                
-                if fetch_thread.is_alive():
-                    # Операция зависла - принудительно прерываем соединение
-                    # ВАЖНО: Закрываем сокет, чтобы прервать блокирующую операцию в потоке
-                    import sys
-                    import os as _os_worker
-                    try:
-                        print(f"[WORKER {_os_worker.getpid()}] STALL DETECTED: Account {config.email} fetch timeout after {fetch_timeout:.1f}s, forcing reconnect", file=sys.stderr, flush=True)
-                    except:
-                        pass
-                    if imap_obj:
-                        try:
-                            if hasattr(imap_obj, 'sock') and imap_obj.sock:
-                                try:
-                                    imap_obj.sock.shutdown(socket.SHUT_RDWR)
-                                except (OSError, AttributeError):
-                                    pass
-                                imap_obj.sock.close()
-                        except Exception:
-                            pass
-                        try:
-                            imap_obj.logout()
-                        except Exception:
-                            pass
-                    state["imap"] = None
-                    state["reconnect_attempts"] = 0
-                    state["next_poll_time"] = _time.time() + reconnect_delay
-                    state["last_poll_time"] = _time.time()
-                    # Поток завершится автоматически (daemon=True) или при закрытии сокета
-                    continue  # Переподключимся на следующей итерации
-                
-                # Получаем результат (поток завершился)
-                with fetch_lock:
-                    if fetch_result["exception"]:
-                        error_type = "temp_error"
-                        count = -2
-                        messages = []
-                    else:
-                        count = fetch_result["count"]
-                        messages = fetch_result["messages"]
-                        error_type = fetch_result["error_type"]
-                
-                # ВАЖНО: Обновляем last_poll_time ПОСЛЕ вызова fetch_new_messages для корректного отслеживания
-                fetch_end_time = _time.time()
-                state["last_poll_time"] = fetch_end_time
-                
-                # Дополнительная проверка: если fetch_new_messages занял слишком много времени, принудительно переподключаем
-                fetch_duration = fetch_end_time - fetch_start_time
-                if fetch_duration > max_stall_time:
-                    # Операция заняла слишком много времени - принудительно переподключаем
-                    import sys
-                    import os as _os_worker
-                    try:
-                        print(f"[WORKER {_os_worker.getpid()}] STALL DETECTED: Account {config.email} fetch took {fetch_duration:.1f}s (> {max_stall_time:.1f}s), forcing reconnect", file=sys.stderr, flush=True)
-                    except:
-                        pass
-                    if imap_obj:
-                        try:
-                            if hasattr(imap_obj, 'sock') and imap_obj.sock:
-                                try:
-                                    imap_obj.sock.shutdown(socket.SHUT_RDWR)
-                                except (OSError, AttributeError):
-                                    pass
-                                imap_obj.sock.close()
-                        except Exception:
-                            pass
-                        try:
-                            imap_obj.logout()
-                        except Exception:
-                            pass
-                    state["imap"] = None
-                    state["reconnect_attempts"] = 0
-                    state["next_poll_time"] = fetch_end_time + reconnect_delay
-                    continue  # Переподключимся на следующей итерации
-                
-                # Отправка результатов
-                if count >= 0:
-                    try:
-                        result = {
-                            "status": "ok",
-                            "count": count,
-                            "messages": messages,
-                            "user_id": config.user_id,
-                            "acc_id": config.acc_id,
-                            "email": config.email,
-                            "chat_id": config.chat_id,  # ВАЖНО: передаем chat_id для публикации
-                            "timestamp": now
-                        }
-                        # ВАЖНО: обрабатываем переполнение очереди - удаляем старое сообщение
-                        if result_queue.full():
-                            try:
-                                result_queue.get_nowait()  # Удаляем старое сообщение
-                            except Exception:
-                                pass  # Игнорируем ошибки при очистке очереди
-                        try:
-                            result_queue.put_nowait(result)
-                        except Exception:
-                            pass  # Игнорируем ошибки при добавлении в очередь
-                    except Exception:
-                        pass
-                    # Успешный опрос - обновляем время следующего опроса
-                    # ВАЖНО: Соединение НЕ закрывается - остается открытым для следующего опроса
-                    # Это позволяет избежать накладных расходов на переподключение
-                    state["next_poll_time"] = now + _random.uniform(poll_interval_min, poll_interval_max)
-                    state["reconnect_attempts"] = 0
-                    # Соединение imap_obj остается в state["imap"] и будет использовано при следующем опросе
-                elif count == -1 and error_type == "auth_error":
-                    # Постоянная ошибка авторизации во время fetch - отключаем чтение аккаунта (не удаляем)
-                    # Закрываем соединение перед отключением
-                    if imap_obj:
-                        try:
-                            if hasattr(imap_obj, 'sock') and imap_obj.sock:
-                                try:
-                                    imap_obj.sock.shutdown(socket.SHUT_RDWR)
-                                except (OSError, AttributeError):
-                                    pass
-                                imap_obj.sock.close()
-                        except Exception:
-                            pass
-                        try:
-                            imap_obj.logout()
-                        except Exception:
-                            pass
-                    state["imap"] = None
-                    state["disabled"] = True
-                    state["auth_error"] = True
-                    state["reconnect_attempts"] = 0
-                    # Отправляем уведомление об ошибке в основной процесс
-                    try:
-                        result = {
-                            "status": "auth_error",
-                            "error": "Permanent auth error during fetch",
-                            "user_id": config.user_id,
-                            "acc_id": config.acc_id,
-                            "email": config.email,
-                            "chat_id": config.chat_id,  # ВАЖНО: передаем chat_id для уведомлений
-                            "timestamp": now
-                        }
-                        if not result_queue.full():
-                            result_queue.put_nowait(result)
-                    except:
-                        pass
-                    continue  # Пропускаем дальнейшую обработку этого аккаунта
-                elif count == -2 or error_type == "temp_error":
-                    try:
-                        result = {
-                            "status": "temp_error",
-                            "error": "Temporary error during fetch",
-                            "user_id": config.user_id,
-                            "acc_id": config.acc_id,
-                            "email": config.email,
-                            "chat_id": config.chat_id,  # ВАЖНО: передаем chat_id для возможных уведомлений
-                            "timestamp": now
-                        }
-                        if not result_queue.full():
-                            result_queue.put_nowait(result)
-                    except:
-                        pass
-                    # Временная ошибка - обновляем время следующего опроса
-                    state["reconnect_attempts"] += 1
-                    if state["reconnect_attempts"] < max_reconnect_attempts:
-                        state["next_poll_time"] = now + reconnect_delay * state["reconnect_attempts"]
-                    else:
-                        state["next_poll_time"] = now + reconnect_delay * max_reconnect_attempts
-            
-            # ВАЖНО: НЕ удаляем аккаунты - они остаются в account_states с флагом disabled=True
-            # Аккаунты с ошибками авторизации уже помечены как disabled и пропускаются при обработке
-            # Это позволяет легко возобновить чтение при исправлении учетных данных
-            
-            # Оптимизация: вычисляем время до следующего опроса и спим до этого времени
-            # Это убирает пустые тики и снижает контекст-переключения
-            # ВАЖНО: Уменьшено максимальное время сна до 0.1 секунды для более частой проверки очереди
-            # Это гарантирует, что новые аккаунты будут обработаны быстрее
-            min_next_poll = min((state.get("next_poll_time", float('inf')) for state in account_states.values()), default=float('inf'))
-            if min_next_poll != float('inf'):
-                sleep_time = max(0.0, min_next_poll - now)
-                if sleep_time > 0.0:
-                    _time.sleep(min(sleep_time, 0.1))  # Максимум 0.1 секунды для более частой проверки очереди и новых аккаунтов
-            else:
-                # Если нет аккаунтов, небольшая пауза
-                _time.sleep(0.05)  # Уменьшено с 0.1 до 0.05 для более частой проверки очереди
-            
-        except Exception as e:
-            # При ошибке ждем немного перед повтором
-            _time.sleep(1.0)
-    
-    # Закрытие всех соединений при выходе
-    # ВАЖНО: закрываем все соединения, чтобы не было утечек сокетов
-    for state in account_states.values():
-        imap_obj = state.get("imap")
-        if imap_obj:
-            try:
-                imap_obj.logout()
-            except Exception:
-                pass
-            finally:
-                # Дополнительная защита: закрываем сокет, если он еще открыт
-                try:
-                    if hasattr(imap_obj, 'sock') and imap_obj.sock:
-                        imap_obj.sock.close()
-                except Exception:
-                    pass
-
-def _cleanup_dead_workers():
-    """
-    Очищает список IMAP_WORKER_PROCESSES от мертвых процессов.
-    Возвращает количество удаленных мертвых процессов.
-    """
-    global IMAP_WORKER_PROCESSES
-    if not IMAP_WORKER_PROCESSES:
-        return 0
-    
-    alive_processes = []
-    dead_count = 0
-    
-    for proc in IMAP_WORKER_PROCESSES:
-        try:
-            if proc.is_alive():
-                alive_processes.append(proc)
-            else:
-                # Процесс мертв - пытаемся его почистить
-                try:
-                    proc.join(timeout=0.1)
-                except Exception:
-                    pass
-                dead_count += 1
-        except Exception:
-            # Если не можем проверить статус - считаем мертвым
-            dead_count += 1
-    
-    IMAP_WORKER_PROCESSES = alive_processes
-    return dead_count
+# ===== NEW IMAP RUNTIME WRAPPERS =====
+# These functions now wrap the new imap_runtime module
 
 def init_imap_worker_pool() -> bool:
     """
-    Инициализация пула процессов IMAP-воркеров.
-    Идемпотентно: повторный вызов не создаёт дубликаты, при необходимости сперва останавливает старый пул.
+    Initialize IMAP runtime - now wraps imap_runtime module.
+    This is a synchronous wrapper for compatibility with existing code.
     """
-    import multiprocessing as _mp
-    global IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_PROCESSES, IMAP_WORKER_STOP_EVENT, IMAP_MP_CONTEXT
-
-    # Если уже живы — ничего не делаем
-    if IMAP_WORKER_PROCESSES and all(p.is_alive() for p in IMAP_WORKER_PROCESSES):
-        return True
-
-    # Попытка мягко закрыть прежние ресурсы
     try:
-        shutdown_imap_worker_pool()
-    except Exception:
-        pass
-
-    ctx = _mp.get_context("spawn")  # Ubuntu 24.04 — безопасно
-    IMAP_MP_CONTEXT = ctx  # Сохраняем контекст для использования в watchdog
-    IMAP_ACCOUNT_QUEUE = ctx.Queue(maxsize=IMAP_ACCOUNT_QUEUE_MAXSIZE)
-    IMAP_RESULT_QUEUE  = ctx.Queue(maxsize=IMAP_RESULT_QUEUE_MAXSIZE)
-    IMAP_WORKER_STOP_EVENT = ctx.Event()
-    IMAP_WORKER_PROCESSES = []
-
-    for i in range(int(IMAP_PROCESS_POOL_SIZE)):
-        p = ctx.Process(
-            target=_imap_worker_pool_worker,
-            args=(
-                IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_STOP_EVENT,
-                IMAP_POLL_INTERVAL_MIN, IMAP_POLL_INTERVAL_MAX,
-                IMAP_CONNECTION_TIMEOUT, IMAP_READ_TIMEOUT, IMAP_WRITE_TIMEOUT,
-                IMAP_NOOP_TIMEOUT, IMAP_RECONNECT_DELAY, IMAP_MAX_RECONNECT_ATTEMPTS, IMAP_PORT_SSL
-            ),
-            name=f"imap-worker-{i}",
-            daemon=True,
-        )
-        p.start()
-        IMAP_WORKER_PROCESSES.append(p)
-
-    return True
+        # Run the async init in a new event loop (sync context)
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If already in async context, schedule it
+                asyncio.create_task(imap_runtime.init_imap_runtime())
+                return True
+        except RuntimeError:
+            pass
+        
+        # Create new loop for sync context
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(imap_runtime.init_imap_runtime())
+            return result
+        finally:
+            loop.close()
+    except Exception as e:
+        log_send_event(f"IMAP: init_imap_worker_pool error: {e}")
+        return False
 
 
 def shutdown_imap_worker_pool():
     """
-    Остановка пула IMAP-воркеров и освобождение очередей.
+    Shutdown IMAP runtime - now wraps imap_runtime module.
+    This is a synchronous wrapper for compatibility with existing code.
     """
-    import time as _time
-    global IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_PROCESSES, IMAP_WORKER_STOP_EVENT
-
-    # Сигнал остановки
     try:
-        if IMAP_WORKER_STOP_EVENT is not None:
-            IMAP_WORKER_STOP_EVENT.set()
-    except Exception:
-        pass
-
-    # Дать время корректному завершению
-    for p in (IMAP_WORKER_PROCESSES or []):
+        # Run the async shutdown in a new event loop (sync context)
+        import asyncio
         try:
-            p.join(timeout=1.5)
-        except Exception:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If already in async context, schedule it
+                asyncio.create_task(imap_runtime.shutdown_imap_runtime())
+                return
+        except RuntimeError:
             pass
-
-    # Принудительное завершение «висящих»
-    for p in (IMAP_WORKER_PROCESSES or []):
+        
+        # Create new loop for sync context
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            if p.is_alive():
-                p.terminate()
-        except Exception:
-            pass
-        try:
-            if p.is_alive():
-                p.kill()
-        except Exception:
-            pass
-
-    IMAP_WORKER_PROCESSES = []
-
-    # Закрыть очереди
-    try:
-        if IMAP_ACCOUNT_QUEUE is not None:
-            try:
-                IMAP_ACCOUNT_QUEUE.close()
-            except Exception:
-                pass
-            IMAP_ACCOUNT_QUEUE = None
-    except Exception:
-        pass
-
-    try:
-        if IMAP_RESULT_QUEUE is not None:
-            try:
-                IMAP_RESULT_QUEUE.close()
-            except Exception:
-                pass
-            IMAP_RESULT_QUEUE = None
-    except Exception:
-        pass
-
-    IMAP_WORKER_STOP_EVENT = None
-    IMAP_MP_CONTEXT = None
-    _time.sleep(0.1)
+            loop.run_until_complete(imap_runtime.shutdown_imap_runtime())
+        finally:
+            loop.close()
+    except Exception as e:
+        log_send_event(f"IMAP: shutdown_imap_worker_pool error: {e}")
 
 
-# УДАЛЕНО: Старая функция _imap_process_worker - полностью удалена
-# Используется только новая архитектура с _imap_worker_pool_worker
+# ===== REMOVED OLD WORKER CODE - NOW USING imap_runtime MODULE =====
 
 async def start_imap_process(user_id: int, acc_id: int, email: str, password: str, display_name: str, chat_id: int, proxy: Optional[Dict[str, Any]] = None) -> bool:
     """
-    Добавление аккаунта в очередь для обработки воркерами пула.
-    ТРЕБУЕТСЯ: proxy должен быть не None и содержать 'host' и 'port'.
-    Без прокси аккаунт не добавляется в очередь (SocksIMAP4SSL требует прокси).
-    
-    ВАЖНО: Новая архитектура с пулом воркеров
-    - Инициализирует пул воркеров при первом вызове (если еще не инициализирован)
-    - Добавляет аккаунт в очередь для обработки воркерами
-    - Воркеры обрабатывают аккаунты из очереди по очереди (IMAP loop)
-    - Это позволяет обрабатывать ~650-1261 аккаунтов с ограниченным количеством процессов (150)
+    Start IMAP worker for account - now wraps imap_runtime module.
+    Proxy is required (IMAP connections use SOCKS proxy).
     """
-    
-    key = (user_id, acc_id)
-    
-    # Инициализация пула воркеров при первом вызове
-    if IMAP_ACCOUNT_QUEUE is None:
-        if not init_imap_worker_pool():
-            log_send_event(f"IMAP: Failed to initialize worker pool for uid={user_id} acc_id={acc_id}")
-            return False
-    
-    # Проверка, не добавлен ли уже аккаунт в обработку
-    if key in IMAP_ACCOUNT_STATUS:
-        status = IMAP_ACCOUNT_STATUS[key]
-        if status.get("active", False):
-            return True  # Аккаунт уже в обработке
-    
-    # ОБЯЗАТЕЛЬНАЯ ПРОВЕРКА ПРОКСИ: без прокси аккаунт не добавляется в очередь
+    # Validate proxy
     if not proxy:
-        log_send_event(f"IMAP: Cannot add account to queue uid={user_id} acc_id={acc_id} email={email}: proxy is required but not provided")
+        log_send_event(f"IMAP: Cannot start account uid={user_id} acc_id={acc_id} email={email}: proxy is required")
         return False
     
-    # Проверка наличия обязательных полей прокси
-    if not isinstance(proxy, dict):
-        log_send_event(f"IMAP: Cannot add account to queue uid={user_id} acc_id={acc_id} email={email}: proxy must be a dict, got {type(proxy)}")
+    if not isinstance(proxy, dict) or "host" not in proxy or "port" not in proxy:
+        log_send_event(f"IMAP: Cannot start account uid={user_id} acc_id={acc_id} email={email}: invalid proxy configuration")
         return False
     
-    if "host" not in proxy or "port" not in proxy:
-        log_send_event(f"IMAP: Cannot add account to queue uid={user_id} acc_id={acc_id} email={email}: proxy must contain 'host' and 'port' keys")
-        return False
-    
-    if not proxy.get("host") or not proxy.get("port"):
-        log_send_event(f"IMAP: Cannot add account to queue uid={user_id} acc_id={acc_id} email={email}: proxy 'host' and 'port' must not be empty")
-        return False
-    
-    # Определение IMAP хоста
-    host = resolve_imap_host(email)
-    
-    # Создание конфигурации
-    config = ImapAccountConfig(
-        user_id=user_id,
-        acc_id=acc_id,
-        email=email,
-        password=password,
-        display_name=display_name,
-        chat_id=chat_id,
-        host=host,
-        proxy=proxy
-    )
-    
-    # Сохранение прокси в account_status для последующего использования в SMTP
-    if proxy:
-        # ВАЖНО: Новая архитектура - прокси сохраняется в кэше для быстрого доступа
-        # Старая логика с UserImapStatus удалена
-        try:
-            # Прокси сохраняется в start_imap_process через st.account_status["_proxy_map"]
-            # Здесь просто логируем для совместимости
-            pass
-        except Exception as e:
-            log_send_event(f"Failed to save proxy for uid={user_id} email={email}: {e}")
-    
-    # Добавление аккаунта в очередь для обработки воркерами
-    # ВАЖНО: используем put_nowait, чтобы не блокироваться
+    # Start worker using new runtime
     try:
-        config_dict = config.to_dict()
-        try:
-            IMAP_ACCOUNT_QUEUE.put_nowait(config_dict)
-            log_send_event(f"IMAP: Account added to queue uid={user_id} acc_id={acc_id} email={email} queue_size={IMAP_ACCOUNT_QUEUE.qsize()}")
-        except Exception as e:
-            log_send_event(f"IMAP: Queue full or error adding account uid={user_id} acc_id={acc_id} email={email}: {e}")
-            return False
+        success = await imap_runtime.start_imap_for_account(
+            user_id=user_id,
+            acc_id=acc_id,
+            email=email,
+            password=password,
+            display_name=display_name,
+            chat_id=chat_id,
+            proxy=proxy
+        )
         
-        # Обновление статуса аккаунта
-        IMAP_ACCOUNT_STATUS[key] = {
-            "active": True,
-            "added_at": time.time()
-        }
+        if success:
+            # Update compatibility status structures
+            key = (user_id, acc_id)
+            IMAP_ACCOUNT_STATUS[key] = {"active": True, "added_at": time.time()}
+            
+            # Update UserImapStatus for compatibility with UI
+            try:
+                st = ensure_user_imap_status(user_id)
+                async with st.lock:
+                    st.running = True
+                    accounts = await list_accounts_async(user_id)
+                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
+                    if acc:
+                        if not hasattr(st, "accounts"):
+                            st.accounts = {}
+                        st.accounts[email] = acc
+                        st.account_status.setdefault(email, {})
+                        st.account_status[email]["active"] = True
+            except Exception as e:
+                log_send_event(f"IMAP: Failed to update status for uid={user_id} acc_id={acc_id}: {e}")
+            
+            log_send_event(f"IMAP: Account started uid={user_id} acc_id={acc_id} email={email}")
+            
+            # Schedule start log notification
+            try:
+                schedule_start_log(user_id, chat_id, email)
+            except Exception as e:
+                log_send_event(f"IMAP: Failed to schedule start log: {e}")
         
-        # ВАЖНО: Обновляем UserImapStatus для совместимости с /read и /status командами
-        # Это нужно для правильного отображения статуса в командах /read и /status
-        try:
-            st = ensure_user_imap_status(user_id)
-            async with st.lock:
-                st.running = True
-                # Получаем объект аккаунта для добавления в st.accounts
-                accounts = await list_accounts_async(user_id)
-                acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
-                if acc:
-                    # Обновляем st.accounts - это нужно для _runtime_is_active
-                    if not hasattr(st, "accounts"):
-                        st.accounts = {}
-                    st.accounts[email] = acc
-                    # Обновляем st.account_status для совместимости
-                    st.account_status.setdefault(email, {})
-                    st.account_status[email]["active"] = True
-        except Exception as e:
-            log_send_event(f"IMAP: Failed to update UserImapStatus for uid={user_id} acc_id={acc_id} email={email}: {e}")
+        return success
         
-        log_send_event(f"IMAP: Account added to queue uid={user_id} acc_id={acc_id} email={email}")
-        
-        # ВАЖНО: отправляем уведомление пользователю через дренер логов
-        try:
-            schedule_start_log(user_id, chat_id, email)
-        except Exception as e:
-            log_send_event(f"IMAP: Failed to schedule start log for uid={user_id} acc_id={acc_id} email={email}: {e}")
-        
-        return True
     except Exception as e:
-        log_send_event(f"IMAP: Failed to add account to queue uid={user_id} acc_id={acc_id} email={email}: {e}")
+        log_send_event(f"IMAP: Failed to start account uid={user_id} acc_id={acc_id} email={email}: {e}")
         return False
+
 
 async def stop_imap_process(user_id: int, acc_id: int) -> bool:
     """
-    Остановка чтения аккаунта (новая архитектура с пулом воркеров).
-    ВАЖНО: Аккаунт НЕ удаляется из воркеров - только помечается как неактивный в IMAP_ACCOUNT_STATUS.
-    Воркеры продолжают хранить аккаунт в account_states, но не обрабатывают его при disabled=True.
-    При повторном вызове start_imap_process аккаунт снова начнет обрабатываться (флаг disabled сбросится).
+    Stop IMAP worker for account - now wraps imap_runtime module.
     """
-    key = (user_id, acc_id)
-    
-    # Помечаем аккаунт как неактивный (не удаляем из воркеров)
-    if key in IMAP_ACCOUNT_STATUS:
-        IMAP_ACCOUNT_STATUS[key] = {"active": False}
-        log_send_event(f"IMAP: Account stopped (marked as inactive) uid={user_id} acc_id={acc_id}")
+    try:
+        success = await imap_runtime.stop_imap_for_account(user_id, acc_id)
         
-        # ВАЖНО: Обновляем UserImapStatus для совместимости с /read и /status командами
+        # Update compatibility status structures
+        key = (user_id, acc_id)
+        if key in IMAP_ACCOUNT_STATUS:
+            IMAP_ACCOUNT_STATUS[key] = {"active": False}
+        
+        # Update UserImapStatus for compatibility with UI
         try:
             st = ensure_user_imap_status(user_id)
             async with st.lock:
-                # Получаем email аккаунта для обновления st.account_status
                 accounts = await list_accounts_async(user_id)
                 acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
                 if acc:
                     email = getattr(acc, "email", "")
                     if email:
-                        # Обновляем st.account_status для совместимости
                         st.account_status.setdefault(email, {})
                         st.account_status[email]["active"] = False
-                        # НЕ удаляем из st.accounts - это может использоваться другими частями кода
         except Exception as e:
-            log_send_event(f"IMAP: Failed to update UserImapStatus on stop for uid={user_id} acc_id={acc_id}: {e}")
+            log_send_event(f"IMAP: Failed to update status on stop: {e}")
         
-        return True
-    
-    # Если аккаунт не был в статусе, все равно логируем остановку
-    log_send_event(f"IMAP: Account stop requested (not in queue) uid={user_id} acc_id={acc_id}")
-    return False
+        log_send_event(f"IMAP: Account stopped uid={user_id} acc_id={acc_id}")
+        return success
+        
+    except Exception as e:
+        log_send_event(f"IMAP: Failed to stop account uid={user_id} acc_id={acc_id}: {e}")
+        return False
+
 
 async def _process_imap_results_global():
     """
-    Глобальный обработчик результатов из общей очереди результатов всех воркеров.
-    Обрабатывает результаты от всех аккаунтов.
+    Global IMAP result processor - now wraps imap_runtime module.
+    This function processes results from the new imap_runtime result queue.
     """
-    if IMAP_RESULT_QUEUE is None:
-        return
-    
-    while True:
+    async def process_result_callback(result: dict):
+        """Callback to process a single IMAP result"""
         try:
-            # Получение результата с таймаутом (ВАЖНО: не блокируемся вечно)
-            try:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: IMAP_RESULT_QUEUE.get(timeout=1.0)  # Таймаут 1 секунда
-                )
-            except Exception:
-                # Timeout или другая ошибка - продолжаем цикл
-                await asyncio.sleep(0.5)
-                continue
-
-            # Извлекаем данные из результата
+            # Extract data from result
             user_id = result.get("user_id")
             acc_id = result.get("acc_id")
             email = result.get("email")
-            
-            if not user_id or not acc_id:
-                continue
-
-            key = (user_id, acc_id)
-            
-            # Получаем chat_id из результата (передается из конфигурации аккаунта)
-            # ВАЖНО: chat_id должен быть в конфигурации аккаунта (ImapAccountConfig.chat_id)
             chat_id = result.get("chat_id")
-            if chat_id:
-                try:
-                    chat_id = int(chat_id)
-                except:
-                    chat_id = None
             
-            # Если chat_id не найден в результате, пытаемся получить из статуса или аккаунта
-            if not chat_id:
-                try:
-                    st = ensure_user_imap_status(user_id)
-                    meta = getattr(st, "account_status", {}).get("_meta", {})
-                    chat_id = meta.get("chat_id")
-                    if chat_id:
-                        chat_id = int(chat_id)
-                except:
-                    pass
+            if not user_id or not acc_id or not chat_id:
+                return
             
-            if not chat_id:
-                # Если chat_id все еще не найден, пытаемся получить из аккаунта
-                try:
-                    accounts = await list_accounts_async(user_id)
-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
-                    if acc:
-                        # Если chat_id не найден, пропускаем обработку (не можем опубликовать без chat_id)
-                        log_send_event(f"IMAP: chat_id not found for uid={user_id} acc_id={acc_id} email={email}, skipping result")
-                        continue
-                except:
-                    pass
-                
-                # Если не удалось получить chat_id, пропускаем обработку
-                continue
-
-            # Обработка результата
-            # ВАЖНО: поддерживаем оба формата результатов для совместимости
-            result_type = result.get("type")
-            result_status = result.get("status")
+            # Publish to Telegram chat using existing function
+            await publish_incoming_to_chat_async(
+                user_id=user_id,
+                chat_id=chat_id,
+                from_email=result.get("from", ""),
+                subject=result.get("subject", ""),
+                body=result.get("body", ""),
+                email_account=email,
+                display_name=result.get("display_name", "")
+            )
             
-            # Формат 1: новый формат с status="ok" и массивом messages
-            if result_status == "ok":
-                count = result.get("count", 0)
-                messages = result.get("messages", [])
-                
-                # ВАЖНО: логируем получение результата для отладки
-                if count > 0:
-                    log_send_event(f"IMAP result: uid={user_id} acc_id={acc_id} email={email} count={count} messages={len(messages) if messages else 0} chat_id={chat_id}")
-                
-                # Получаем аккаунт
-                acc = None
-                try:
-                    accounts = await list_accounts_async(user_id)
-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
-                except Exception as e:
-                    log_send_event(f"IMAP result processing error uid={user_id} acc_id={acc_id}: {e}")
-                
-                # ВАЖНО: проверяем все условия перед публикацией
-                if count > 0 and messages and acc and chat_id:
-                    # ВАЖНО: Проверяем период "карантина" для аккаунтов, добавленных через быстрое добавление
-                    # Если аккаунт был активирован недавно, не публикуем письма, чтобы избежать публикации старых писем
-                    key = (user_id, acc_id)
-                    activated_at = QUICK_ADD_ACTIVATED_AT.get(key)
-                    if activated_at is not None:
-                        time_since_activation = time.time() - activated_at
-                        if time_since_activation < QUICK_ADD_QUARANTINE_PERIOD:
-                            # Аккаунт в периоде карантина - не публикуем письма
-                            log_send_event(f"IMAP: Пропуск публикации {len(messages)} писем (период карантина, осталось {QUICK_ADD_QUARANTINE_PERIOD - time_since_activation:.1f}s) uid={user_id} acc_id={acc_id} email={email}")
-                            continue
-                        else:
-                            # Период карантина истек - удаляем запись и публикуем письма
-                            QUICK_ADD_ACTIVATED_AT.pop(key, None)
-                            log_send_event(f"IMAP: Период карантина истек, публикуем письма uid={user_id} acc_id={acc_id} email={email}")
-                    
-                    # Публикуем сообщения
-                    try:
-                        log_send_event(f"IMAP: Publishing {len(messages)} messages for uid={user_id} acc_id={acc_id} email={email} chat_id={chat_id}")
-                        for mdat in messages:
-                            await publish_incoming_to_chat_async(user_id, acc, chat_id, mdat)
-                        log_send_event(f"IMAP: Successfully published {len(messages)} messages for uid={user_id} acc_id={acc_id}")
-                    except Exception as e:
-                        log_send_event(f"IMAP publish messages error uid={user_id} acc_id={acc_id}: {e}")
-                elif count > 0:
-                    # Логируем, почему не публикуем
-                    reasons = []
-                    if not messages:
-                        reasons.append("messages is empty")
-                    if not acc:
-                        reasons.append("acc is None")
-                    if not chat_id:
-                        reasons.append("chat_id is None")
-                    log_send_event(f"IMAP: Skipping publication for uid={user_id} acc_id={acc_id} count={count}: {', '.join(reasons)}")
-            
-            # Формат 2: старый формат с type="incoming_message" (для совместимости)
-            elif result_type == "incoming_message":
-                try:
-                    message_data = result.get("message")
-                    
-                    if not user_id or not acc_id or not chat_id or not message_data:
-                        log_send_event(f"IMAP: Incomplete incoming_message data uid={user_id} acc_id={acc_id} chat_id={chat_id}")
-                        continue
-                    
-                    # Получаем объект аккаунта (для контекста)
-                    accounts = await list_accounts_async(user_id)
-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
-                    
-                    if not acc:
-                        log_send_event(f"IMAP: Account not found uid={user_id} acc_id={acc_id}")
-                        continue
-                    
-                    # ВАЖНО: Проверяем период "карантина" для аккаунтов, добавленных через быстрое добавление
-                    key = (user_id, acc_id)
-                    activated_at = QUICK_ADD_ACTIVATED_AT.get(key)
-                    if activated_at is not None:
-                        time_since_activation = time.time() - activated_at
-                        if time_since_activation < QUICK_ADD_QUARANTINE_PERIOD:
-                            # Аккаунт в периоде карантина - не публикуем письма
-                            log_send_event(f"IMAP: Пропуск публикации письма (период карантина, осталось {QUICK_ADD_QUARANTINE_PERIOD - time_since_activation:.1f}s) uid={user_id} acc_id={acc_id}")
-                            continue
-                        else:
-                            # Период карантина истек - удаляем запись и публикуем письма
-                            QUICK_ADD_ACTIVATED_AT.pop(key, None)
-                            log_send_event(f"IMAP: Период карантина истек, публикуем письмо uid={user_id} acc_id={acc_id}")
-                    
-                    # ВАЖНО: публикуем входящее сообщение
-                    log_send_event(f"IMAP: Publishing incoming_message (old format) uid={user_id} acc_id={acc_id} chat_id={chat_id}")
-                    await publish_incoming_to_chat_async(user_id, acc, chat_id, message_data)
-                    log_send_event(f"IMAP: Successfully published incoming_message uid={user_id} acc_id={acc_id}")
-                except Exception as e:
-                    log_send_event(f"IMAP publish error (old format) uid={user_id} acc_id={acc_id}: {e}")
-            
-            # Обновление статуса и сохранение прокси для SMTP (только для формата status="ok")
-            if result_status == "ok":
-                acc = None
-                try:
-                    accounts = await list_accounts_async(user_id)
-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
-                except Exception as e:
-                    pass
-                
-                if acc:
-                    st = ensure_user_imap_status(user_id)
-                    async with st.lock:
-                        st.account_status.setdefault(acc.email, {})
-                        # Получаем прокси из конфигурации процесса (если еще не сохранен)
-                        proxy = st.account_status.get("_proxy_map", {}).get(acc.email)
-                        if proxy:
-                            st.account_status[acc.email]["proxy"] = proxy
-                        
-                        st.account_status[acc.email].update({
-                            "active": True,
-                            "last_ok": str(int(time.time())),
-                            "last_err": None,
-                            "retries": 0,
-                        })
-                    
-                    # Сохраняем sticky proxy только для IMAP (чтение)
-                    # ВАЖНО: sticky proxy больше НЕ используется для отправки писем (SMTP)
-                    # Отправка использует простой round-robin по всем send-прокси из контекста
-                    # TODO: Для долговременного хранения нужно сохранять sticky proxy в БД
-                    # (например, в таблице accounts добавить поле sticky_proxy_json или отдельная таблица account_proxy_sticky)
-                    if proxy:
-                        try:
-                            # Сохраняем sticky proxy для IMAP (чтение) - для отправки не используется
-                            if hasattr(smtp25, 'set_sticky_proxy_for_account'):
-                                smtp25.set_sticky_proxy_for_account(user_id, acc.email, proxy)
-                            
-                            # TODO: Сохранить sticky proxy в БД для долговременного хранения
-                            # await save_account_sticky_proxy_async(user_id, acc.email, proxy)
-                        except Exception as e:
-                            # Игнорируем ошибки, если функция не доступна или не работает
-                            pass
-            
-            elif result.get("status") == "auth_error":
-                # Постоянная ошибка авторизации
-                try:
-                    accounts = await list_accounts_async(user_id)
-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
-                    if acc:
-                        st = ensure_user_imap_status(user_id)
-                        async with st.lock:
-                            st.account_status.setdefault(acc.email, {})
-                            st.account_status[acc.email].update({
-                        "active": False,
-                        "perm_auth_error": True,
-                        "reading_disabled_due_to_auth": True,
-                                "last_err": "Permanent auth error",
-                            })
-                        
-                        # ВАЖНО: Отключаем аккаунт для сендинга при ошибке авторизации
-                        try:
-                            await ensure_send_disabled_loaded(user_id)
-                            disabled = SEND_DISABLED_ACCOUNTS.setdefault(user_id, set())
-                            was_send_enabled = acc_id not in disabled
-                            
-                            # Добавляем аккаунт в список отключенных для сендинга
-                            disabled.add(acc_id)
-                            await set_setting_async(user_id, f"send_disabled_{acc_id}", "1")
-                            
-                            # Инвалидируем контекст пользователя, чтобы изменения применились сразу
-                            try:
-                                invalidate_user_ctx(user_id)
-                            except Exception:
-                                pass
-                            
-                            if was_send_enabled:
-                                log_send_event(
-                                    f"IMAP: Аккаунт {acc.email} (acc_id={acc_id}) отключен для сендинга "
-                                    f"из-за ошибки авторизации (был включен для сендинга)"
-                                )
-                        except Exception as e_send:
-                            log_send_event(
-                                f"IMAP: Ошибка при отключении аккаунта для сендинга "
-                                f"uid={user_id} acc_id={acc_id} email={acc.email}: {e_send}"
-                            )
-                        
-                        # Логирование и уведомление пользователю
-                        key_notify = (user_id, acc.email)
-                        if not PERM_AUTH_NOTIFIED.get(key_notify):
-                            PERM_AUTH_NOTIFIED[key_notify] = True
-                            log_send_event(f"IMAP: Permanent auth error detected for uid={user_id} acc_id={acc_id} email={acc.email}, disabling account")
-                            # ВАЖНО: проверяем chat_id перед отправкой уведомления
-                            if chat_id:
-                                try:
-                                    await bot.send_message(
-                                        chat_id,
-                                        f"Аккаунт {code(acc.email)} отключён: неверные учетные данные.\n"
-                                        f"Аккаунт отключен для чтения и сендинга.\n"
-                                        f"Исправьте пароль и запустите /read."
-                                    )
-                                except Exception as e:
-                                    log_send_event(f"IMAP: Failed to send notification to chat_id={chat_id} for uid={user_id} acc_id={acc_id}: {e}")
-                            else:
-                                log_send_event(f"IMAP: Cannot send auth error notification for uid={user_id} acc_id={acc_id}: chat_id not found")
-                        
-                        # Удаляем аккаунт из обработки
-                        await stop_imap_process(user_id, acc_id)
-                except Exception as e:
-                    log_send_event(f"IMAP auth error handling uid={user_id} acc_id={acc_id}: {e}")
-            
-            elif result.get("status") == "temp_error":
-                # Временная ошибка - обновляем статус, но продолжаем
-                try:
-                    accounts = await list_accounts_async(user_id)
-                    acc = next((a for a in accounts if int(getattr(a, "id")) == acc_id), None)
-                    if acc:
-                        st = ensure_user_imap_status(user_id)
-                        async with st.lock:
-                            st.account_status.setdefault(acc.email, {})
-                            st_entry = st.account_status[acc.email]
-                            retries = int(st_entry.get("retries", 0)) + 1
-                            backoff_soft = min(IMAP_BACKOFF_MAX, 5 * (1.5 ** min(retries, 6)))
-                            st_entry.update({
-                                "active": False,
-                                "last_err": result.get("error", "Temporary error"),
-                                "retries": retries,
-                                "retry_at": time.time() + backoff_soft,
-                            })
-                except Exception as e:
-                    log_send_event(f"IMAP temp error handling uid={user_id} acc_id={acc_id}: {e}")
-
-        except asyncio.CancelledError:
-            break
         except Exception as e:
-            log_send_event(f"IMAP global result processor error: {e}")
-            await asyncio.sleep(1.0)
+            log_send_event(f"IMAP: Error processing result: {e}")
+            traceback.print_exc()
+    
+    # Run the result processing loop from imap_runtime
+    try:
+        await imap_runtime.process_imap_results_loop(process_result_callback)
+    except Exception as e:
+        log_send_event(f"IMAP: Result processor error: {e}")
+
 
 async def _imap_watchdog():
     """
-    Watchdog для мониторинга воркеров пула и перезапуска упавших процессов.
-    Проверяет воркеры каждые 30 секунд, очищает мертвые процессы и перезапускает упавшие.
-    ВАЖНО: Периодически очищает мертвые процессы из списка, чтобы предотвратить утечку памяти.
+    IMAP watchdog - now a stub (imap_runtime manages its own processes).
+    Kept for compatibility but does nothing.
     """
     while True:
         try:
-            await asyncio.sleep(30.0)  # Проверка каждые 30 секунд
-            
-            # ВАЖНО: Сначала очищаем мертвые процессы из списка
-            # Это предотвращает накопление мертвых процессов в памяти
-            try:
-                dead_count = _cleanup_dead_workers()
-                if dead_count > 0:
-                    log_send_event(f"IMAP: Cleaned up {dead_count} dead workers")
-            except Exception as e:
-                log_send_event(f"IMAP: Error cleaning up dead workers: {e}")
-            
-            # Проверяем воркеры пула
-            # ВАЖНО: проверяем только если пул инициализирован
-            if IMAP_WORKER_PROCESSES and IMAP_ACCOUNT_QUEUE is not None and IMAP_RESULT_QUEUE is not None and IMAP_WORKER_STOP_EVENT is not None:
-                # Проверяем каждый воркер и перезапускаем упавшие
-                for i, proc in enumerate(list(IMAP_WORKER_PROCESSES)):
-                    try:
-                        if not proc.is_alive():
-                            # Воркер упал - перезапускаем
-                            try:
-                                log_send_event(f"IMAP: Worker {i} died, restarting...")
-                                # ВАЖНО: Используем тот же контекст multiprocessing, что и при инициализации
-                                if IMAP_MP_CONTEXT is None:
-                                    import multiprocessing as _mp
-                                    ctx = _mp.get_context("spawn")
-                                else:
-                                    ctx = IMAP_MP_CONTEXT
-                                
-                                new_proc = ctx.Process(
-                                    target=_imap_worker_pool_worker,
-                                    args=(
-                                        IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_STOP_EVENT,
-                                        IMAP_POLL_INTERVAL_MIN, IMAP_POLL_INTERVAL_MAX,
-                                        IMAP_CONNECTION_TIMEOUT, IMAP_READ_TIMEOUT, IMAP_WRITE_TIMEOUT,
-                                        IMAP_NOOP_TIMEOUT, IMAP_RECONNECT_DELAY, IMAP_MAX_RECONNECT_ATTEMPTS, IMAP_PORT_SSL
-                                    ),
-                                    name=f"imap-worker-{i}",
-                                    daemon=True
-                                )
-                                new_proc.start()
-                                # Заменяем мертвый процесс на новый в списке
-                                if i < len(IMAP_WORKER_PROCESSES):
-                                    IMAP_WORKER_PROCESSES[i] = new_proc
-                                else:
-                                    IMAP_WORKER_PROCESSES.append(new_proc)
-                                log_send_event(f"IMAP: Worker {i} restarted")
-                            except Exception as e:
-                                log_send_event(f"IMAP: Failed to restart worker {i}: {e}")
-                    except Exception as e:
-                        log_send_event(f"IMAP: Error checking worker {i}: {e}")
-                
-                # ВАЖНО: Если количество живых воркеров меньше требуемого, добавляем новые
-                try:
-                    alive_count = sum(1 for p in IMAP_WORKER_PROCESSES if p.is_alive())
-                    if alive_count < IMAP_PROCESS_POOL_SIZE:
-                        needed = IMAP_PROCESS_POOL_SIZE - alive_count
-                        log_send_event(f"IMAP: Only {alive_count}/{IMAP_PROCESS_POOL_SIZE} workers alive, creating {needed} new workers")
-                        for _ in range(needed):
-                            try:
-                                # ВАЖНО: Используем тот же контекст multiprocessing, что и при инициализации
-                                if IMAP_MP_CONTEXT is None:
-                                    import multiprocessing as _mp
-                                    ctx = _mp.get_context("spawn")
-                                else:
-                                    ctx = IMAP_MP_CONTEXT
-                                
-                                worker_index = len(IMAP_WORKER_PROCESSES)
-                                new_proc = ctx.Process(
-                                    target=_imap_worker_pool_worker,
-                                    args=(
-                                        IMAP_ACCOUNT_QUEUE, IMAP_RESULT_QUEUE, IMAP_WORKER_STOP_EVENT,
-                                        IMAP_POLL_INTERVAL_MIN, IMAP_POLL_INTERVAL_MAX,
-                                        IMAP_CONNECTION_TIMEOUT, IMAP_READ_TIMEOUT, IMAP_WRITE_TIMEOUT,
-                                        IMAP_NOOP_TIMEOUT, IMAP_RECONNECT_DELAY, IMAP_MAX_RECONNECT_ATTEMPTS, IMAP_PORT_SSL
-                                    ),
-                                    name=f"imap-worker-{worker_index}",
-                                    daemon=True
-                                )
-                                new_proc.start()
-                                IMAP_WORKER_PROCESSES.append(new_proc)
-                            except Exception as e:
-                                log_send_event(f"IMAP: Failed to create new worker: {e}")
-                except Exception as e:
-                    log_send_event(f"IMAP: Error checking worker count: {e}")
+            await asyncio.sleep(30.0)
+            # The new imap_runtime module manages its own processes
+            # No watchdog needed
         except asyncio.CancelledError:
             break
         except Exception as e:
             log_send_event(f"IMAP watchdog error: {e}")
             await asyncio.sleep(10.0)
+
+# ===== END NEW IMAP RUNTIME WRAPPERS =====
 
 def get_account_proxy(user_id: int, email: str) -> Optional[Dict[str, Any]]:
     """
@@ -10551,110 +8963,6 @@ def _extract_body(msg) -> str:
     body = re.sub(r"\n{3,}", "\n\n", body).strip()
     return body[:3500]
 
-class SocksIMAP4SSL(imaplib.IMAP4):
-    def __init__(
-        self,
-        host: str,
-        port: int = IMAP_PORT_SSL,
-        proxy: dict | None = None,
-        timeout: int = IMAP_TIMEOUT,
-        ssl_context: Optional[ssl.SSLContext] = None,
-    ):
-        self._proxy = proxy or {}
-        self._timeout = timeout
-        self._ssl_context = ssl_context or ssl.create_default_context()
-        # Вызываем базовый конструктор без timeout kwarg — base may not accept it.
-        super().__init__(host, port)
-
-    def open(self, host: str, port: int, timeout: Optional[float] = None):
-        # Создаём SOCKS5‑сокет с аутентификацией прокси
-        s = socks.socksocket()
-        s.set_proxy(
-            socks.SOCKS5,
-            self._proxy["host"],
-            int(self._proxy["port"]),
-            True,
-            self._proxy.get("user") or None,
-            self._proxy.get("password") or None,
-        )
-        s.settimeout(timeout if timeout is not None else self._timeout)
-        s.connect((host, port))
-
-        # Оборачиваем в TLS и ПРИСВАИВАЕМ self.sock/self.file (ничего не возвращаем)
-        ssock = self._ssl_context.wrap_socket(s, server_hostname=host)
-        self.sock = ssock
-        self.file = self.sock.makefile("rb")
-        
-def _connect_send_with_retries(ctx: smtp25.UserContext, host: str, timeout: int, attempts: int = 3) -> tuple[imaplib.IMAP4_SSL | None, str]:
-    """
-    Try several quick connections in a row through SEND SOCKS proxies.
-    Returns (imap, via_descr). If failed, returns (None, reason).
-    """
-    last_err = None
-    for i in range(max(1, attempts)):
-        try:
-            proxy = smtp25.get_next_proxy_ctx(ctx, "send")
-            if not proxy:
-                last_err = RuntimeError("no SEND proxy available")
-                break
-            imap = SocksIMAP4SSL(host, IMAP_PORT_SSL, proxy=proxy, timeout=timeout)
-            return imap, f"via send {proxy.get('host')}:{proxy.get('port')} (try {i+1})"
-        except Exception as e:
-            last_err = e
-            time.sleep(0.25 + 0.25 * i)
-    return None, f"SEND proxies failed: {type(last_err).__name__}: {last_err}" if last_err else "SEND proxies failed: unknown"
-    
-def _imap_alive_and_ready(imap: imaplib.IMAP4) -> bool:
-    """
-    Быстрая проверка «живости» уже установленного IMAP‑соединения.
-
-    Лёгкий путь:
-      1) Пробуем NOOP — это дешёвый пинг; если OK -> соединение считаем рабочим.
-      2) Если NOOP не OK — один раз пробуем SELECT INBOX как fallback
-         (на случай, если сокет жив, но выбранный ящик сброшен на сервере).
-      3) Любое исключение -> False (соединение считаем нерабочим).
-    """
-    try:
-        # Устанавливаем таймаут для NOOP
-        if hasattr(imap, 'sock') and imap.sock:
-            imap.sock.settimeout(IMAP_NOOP_TIMEOUT)
-        typ, _ = imap.noop()
-        if str(typ).upper() == "OK":
-            return True
-        # fallback: попытка «реанимировать» выбранный ящик
-        try:
-            if hasattr(imap, 'sock') and imap.sock:
-                imap.sock.settimeout(IMAP_TIMEOUT)
-            typ2, _ = imap.select("INBOX")
-            return str(typ2).upper() == "OK"
-        except Exception:
-            return False
-    except Exception:
-        return False
-        
-def _connect_imap_via_proxy(
-    host: str,
-    acc_email: str,
-    acc_password: str,
-    proxy: dict,
-    timeout: int
-) -> tuple[imaplib.IMAP4, str]:
-    """
-    Создаёт новое IMAP SSL‑соединение через указанный SEND‑прокси и логинится.
-    Возвращает (imap, via_descr).
-    """
-    imap = SocksIMAP4SSL(host, IMAP_PORT_SSL, proxy=proxy, timeout=timeout)
-    imap.login(acc_email, acc_password)
-    typ, _ = imap.select("INBOX")
-    if str(typ).upper() != "OK":
-        try:
-            imap.logout()
-        except Exception:
-            pass
-        raise RuntimeError("IMAP select INBOX failed after connect")
-    via_descr = f"via send {proxy.get('host')}:{proxy.get('port')}"
-    return imap, via_descr
-    
 def _get_or_connect_imap(
     ctx: "smtp25.UserContext",
     acc: Any,
